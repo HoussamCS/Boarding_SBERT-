@@ -1,0 +1,31 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large Data & Embeddings (Keep in project but do not commit to Git)
+data/raw/dataset.csv
+data/processed/*.npy
+data/processed/*.parquet
+models/boarding_sbert_model/model.safetensors
+
+# Frontend Build & Node dependencies (Reserved for the web team)
+web/node_modules/
+web/dist/
+web/.next/
+web/out/
+web/*.log
