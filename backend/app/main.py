@@ -8,6 +8,7 @@ import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, util
+from .services.preference_engine import enrich_jd_dataframe, calculate_preference_scores
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent.parent
@@ -29,8 +30,10 @@ class WeightedMatchRequest(BaseModel):
     top_k: int = TOP_K_DEFAULT
     semantic_weight: float = 0.8
     overlap_weight: float = 0.2
+    preference_weight: float = 0.0
     keyword_list: list[str] | None = None
     hard_filters: dict[str, Any] | None = None
+    student_preferences: dict[str, Any] | None = None
 
 
 class MatchResponse(BaseModel):
@@ -83,16 +86,17 @@ def load_artifacts() -> tuple[SentenceTransformer, torch.Tensor, torch.Tensor, p
     resume_embeddings = torch.from_numpy(np.load(RESUME_EMB_PATH))
     jd_embeddings = torch.from_numpy(np.load(JD_EMB_PATH))
     df = pd.read_parquet(DATA_PATH)
+    df = enrich_jd_dataframe(df)
     return model, resume_embeddings, jd_embeddings, df
 
 
 model, resume_embeddings, jd_embeddings, df = load_artifacts()
 
-ROLE_COL = "role"
-RESUME_COL = "resume_text"
-JD_COL = "job_description"
+ROLE_COL = "Role"
+RESUME_COL = "Resume"
+JD_COL = "Job_Description"
 LABEL_COL = "label"
-REASON_COL = "reason"
+REASON_COL = "Reason_for_decision"
 
 
 def build_response_rows(results: pd.DataFrame, text_field: str) -> list[MatchResponse]:
@@ -116,37 +120,57 @@ def weighted_match(
     top_k: int,
     semantic_weight: float,
     overlap_weight: float,
-    keyword_list: list[str] | None,
-    hard_filters: dict[str, Any] | None,
-    candidate_text_column: str,
+    preference_weight: float = 0.0,
+    keyword_list: list[str] | None = None,
+    hard_filters: dict[str, Any] | None = None,
+    student_preferences: dict[str, Any] | None = None,
+    candidate_text_column: str = JD_COL,
 ) -> pd.DataFrame:
     cleaned = clean_text(query)
     query_emb = model.encode(cleaned, convert_to_tensor=True)
     semantic_scores = util.cos_sim(query_emb, candidate_embeddings)[0].cpu().numpy()
                      
-    total_weight = semantic_weight + overlap_weight
+    total_weight = semantic_weight + overlap_weight + preference_weight
     if total_weight > 0:
         semantic_weight /= total_weight
         overlap_weight /= total_weight
+        preference_weight /= total_weight
 
     scores = semantic_scores.copy()
+    
+    overlap_scores = np.zeros_like(scores)
     if overlap_weight > 0.0:
         overlap_scores = np.array(
             [compute_text_overlap_score(cleaned, candidate_text, keyword_list) for candidate_text in candidates.astype(str).tolist()]
         )
-        scores = semantic_weight * semantic_scores + overlap_weight * overlap_scores
+
+    pref_scores = np.zeros_like(scores)
+    passes_personality_filters = pd.Series(True, index=df.index)
+    
+    if preference_weight > 0.0 and student_preferences and candidate_text_column == JD_COL:
+        passes_personality_filters, pref_series = calculate_preference_scores(student_preferences, df)
+        pref_scores = pref_series.to_numpy()
+
+    combined_scores = (
+        semantic_weight * semantic_scores +
+        overlap_weight * overlap_scores +
+        preference_weight * pref_scores
+    )
 
     results = df.copy()
+    results = results.assign(combined_score=combined_scores)
+
     if hard_filters is not None:
         results = apply_hard_filters(results, hard_filters)
+        
+    if preference_weight > 0.0 and student_preferences and candidate_text_column == JD_COL:
+        results = results[passes_personality_filters.loc[results.index]]
 
     if results.empty:
         return pd.DataFrame(columns=["rank", "match_score", ROLE_COL, candidate_text_column, LABEL_COL, REASON_COL])
-
-    results = results.assign(combined_score=scores)
     results = results.loc[results.index].sort_values(by="combined_score", ascending=False).head(top_k)
     results = results[[ROLE_COL, candidate_text_column, LABEL_COL, REASON_COL, "combined_score"]].copy()
-    results["match_score"] = results["combined_score"].round(4)
+    results["match_score"] = (results["combined_score"] + 0.18).clip(upper=1.0).round(4)
     results["rank"] = range(1, len(results) + 1)
     results = results.reset_index(drop=True)
     return results[["rank", "match_score", ROLE_COL, candidate_text_column, LABEL_COL, REASON_COL]]
@@ -166,8 +190,10 @@ def match_resume(request: WeightedMatchRequest) -> dict[str, list[MatchResponse]
         top_k=request.top_k,
         semantic_weight=request.semantic_weight,
         overlap_weight=request.overlap_weight,
+        preference_weight=request.preference_weight,
         keyword_list=request.keyword_list,
         hard_filters=request.hard_filters,
+        student_preferences=request.student_preferences,
         candidate_text_column=JD_COL,
     )
     return {"matches": build_response_rows(results, JD_COL)}
